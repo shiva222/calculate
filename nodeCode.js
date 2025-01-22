@@ -1,3 +1,117 @@
+/*
+useCase: We have multiple merchants and multiple salesman,
+Each salesman has many merchants.
+When merchant make a transaction salesman balance need to be reduced. It created a race condition when all merchant try to reduce balance from 
+single merchant. As locks are in place first req to reach server will be successful. 
+
+To resolve the issue I have made the process into 2 parts. 
+1. add balance to the merchant directly.
+2. reduce balance from salesman all togeather when api is hit.
+
+syncSalesmanSummary in this function merchantCount we get from req.params
+            attributes: [
+              [Sequelize.col('merchant_id'), 'merchantId'],
+              [Sequelize.col('salesman_id'), 'salesmanId'],
+              [Sequelize.literal('array_agg(id)'), 'idList'],
+              [Sequelize.literal('SUM("amount")'), 'totalAmount'],
+              [Sequelize.literal('COUNT(*)'), 'totalRecords']
+            ],
+            where: {
+              data_synced: false
+            },
+            group: ['merchant_id', 'salesman_id'],
+            limit: merchantCount,
+            raw: true
+     this is a Sequelize query on db to group merchant_id and salesman_id and sum total amount to be reduced in totalAmount, idList that holds list 
+     of primary ids that are used for later modification, totalRecords for number of times merchant made transactions
+
+                 const transaction = await db.transaction({ autocommit: false });
+transactions are used to commit everything or nothing case.
+find the salesman and lock him till his balance is changed
+update the salesman balance
+store the changes made in merchantBalanceOrderSummaryModel table it will have id as primary key
+update the id(summeryId) primary key in merchantBalanceOrderModel table that has id present in idList
+
+
+syncSalesmanPayment is updating salesman balance by transaction by transaction.
+the potential drawback with this is it takes lot of time but it can track start and end balance for transaction by transaction and update in bulk process
+*/
+
+router.get('/reduceBalanceByMerchant/:merchantCount', MADA.syncSalesmanSummary);
+router.get('/reduceBalancebyTransaction/:recordLimit', MADA.syncSalesmanPayment);
+
+async syncSalesmanSummary(req, res) {
+    try {
+        const { merchantCount } = req.params;
+        const result = await merchantBalanceOrderModel.findAll({
+            attributes: [
+                [Sequelize.col('merchant_id'), 'merchantId'],
+                [Sequelize.col('salesman_id'), 'salesmanId'],
+                [Sequelize.literal('array_agg(id)'), 'idList'],
+                [Sequelize.literal('SUM("amount")'), 'totalAmount'],
+                [Sequelize.literal('COUNT(*)'), 'totalRecords']
+            ],
+            where: {
+                data_synced: false
+            },
+            group: ['merchant_id', 'salesman_id'],
+            limit: +merchantCount,
+            raw: true
+        });
+        for (const info of result) {
+            const transaction = await db.transaction({ autocommit: false });
+            try {
+                const salesman = await salesmanModel.findOne({
+                    raw: true,
+                    where: { employeeId: info.salesmanId },
+                    lock: transaction.LOCK.UPDATE,
+                    skipLocked: true,
+                    transaction,
+                });
+
+                if (!salesman) {
+                    await transaction.rollback();
+                    return res.status(404).json({ message: `Salesman with ID ${info.salesmanId} not found` });
+                }
+                let endBalance = parseFloat(salesman.balance);
+                endBalance -= parseFloat(info.totalAmount)
+                const { merchantId, salesmanId, totalAmount, totalRecords, idList } = info;
+
+                await salesmanModel.update(
+                    { balance: endBalance },
+                    { where: { employeeId: salesmanId }, transaction }
+                );
+
+
+                const summary = await merchantBalanceOrderSummaryModel.create({ merchantId, salesmanId, totalAmount, totalRecords }, { transaction });
+                const summaryId = summary.id;
+                await merchantBalanceOrderModel.update(
+                    { dataSynced: true, batchId: summaryId, syncedAt: new Date() },
+                    {
+                        where: {
+                            id: {
+                                [Sequelize.Op.in]: idList
+                            }
+                        },
+                        transaction
+                    }
+                );
+                await transaction.commit();
+            } catch (error) {
+                console.log(error);
+
+            }
+        }
+        console.log(result);
+        return res.status(200).json(result);
+
+    } catch (error) {
+        console.log(error);
+        return res.status(500).json(rspCode.DEFAULT);
+    }
+},
+
+
 async syncSalesmanPayment(req, res) {
     try {
         const { recordLimit } = req.params;
